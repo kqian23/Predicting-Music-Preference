@@ -1,0 +1,349 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+# 0 Load Package and Clean up Environment
+```{r}
+library(gbm)
+library(dplyr)
+library(Metrics)
+library(ggplot2)
+library(corrplot)
+library(pROC)
+library(tidyverse)
+library(randomForest)
+
+# Clean up
+rm(list=ls())
+cat("\04")
+```
+
+
+# 1 Import and Merge
+```{r}
+# import cleaned data
+train_all <- read.csv('data/train_all.csv')
+
+```
+
+
+# 2 Explore Data
+## 2.1 Variable Type and Dimension
+```{r}
+# Examine Variables
+str(train_all)
+
+# Shape of data
+dim(train_all)
+
+# convert categorical data into 'factor'
+train_all$REGION <- as.factor(train_all$REGION)
+train_all$GENDER <- as.factor(train_all$GENDER)
+train_all$WORKING <- as.factor(train_all$WORKING)
+```
+According to the data description, missing value
+
+## 2.2 Explore the objective variable - Rating
+```{r}
+# Explore the objective variable - Rating
+summary(train_all$Rating)
+
+# Plot Rating
+ggplot(data=train_all[!is.na(train_all$Rating),], aes(x=Rating)) + 
+  geom_histogram(fill="lightblue") + scale_x_continuous(breaks = seq(0,100, by=10))
+```
+## 2.3 Explore Correlation between Variables
+```{r}
+# Variable Correlation
+# Get all the numeric variables (this also includes ordinal variables since we encode them as integers)
+numeric_var <- train_all[,which(!sapply(train_all, is.factor))]
+# save name vector for later use
+numeric_names <- colnames(numeric_var)
+# get the pairwise correlation for all variables
+cor <- cor(numeric_var[4:ncol(numeric_var)], use="pairwise.complete.obs")
+# sort on decreasing correlation with Rating
+cor_sorted <- as.matrix(sort(cor[,'Rating'], decreasing = TRUE))
+# Select only high correlations
+cor_high <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.32)))
+
+# plot the correlation
+cor_mix <- cor[cor_high,cor_high]
+corrplot.mixed(cor_mix, tl.col="black", tl.pos = "lt")
+
+```
+
+## 2.4 Dig Deeper into the Relationship Between Rating and Other Variables
+### 2.4.1 Rating and LIKE_ARTIST
+```{r}
+# Plot rating and LIKE_ARTIST
+ggplot(data=train_all[!is.na(train_all$Rating),], aes(x=LIKE_ARTIST, y=Rating))+
+        geom_point(col='blue', alpha = 0.1) + geom_smooth(method = "lm", se=FALSE, color="black", aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 100, by=10))
+```
+
+### 2.4.2 Rating and OWN_ARTIST_MUSIC
+```{r}
+ggplot(data=train_all[!is.na(train_all$Rating),], aes(x=factor(OWN_ARTIST_MUSIC), y=Rating))+
+        geom_boxplot(col='blue') + labs(x='Whether the user has this artist in playlist', y = "Rating of a song by this artist") +
+        scale_y_continuous(breaks= seq(0, 100, by=10))
+```
+### 2.4.3 Rating and Good.Lyrics
+```{r}
+ggplot(data=train_all[!is.na(train_all$Rating),], aes(x=factor(Good.Lyrics), y=Rating))+
+        geom_boxplot(col='blue') + labs(x='Whether the user think the artist compose good lyrics', y = "Rating of a song by this artist") + scale_y_continuous(breaks= seq(0, 100, by=10))
+```
+### 2.4.4 Rating and HEARD_OF
+```{r}
+ggplot(data=train_all[!is.na(train_all$Rating),], aes(x=factor(HEARD_OF), y=Rating))+
+        geom_boxplot(col='blue') + labs(x='Whether the user has heard of music by this artist', y = "Rating of a song by this artist") + scale_y_continuous(breaks= seq(0, 100, by=10))
+```
+
+### 2.4.5 Rating and Attitude toward music
+```{r}
+ggplot(data=train_all[!is.na(train_all$Rating),], aes(x=factor(MUSIC), y=Rating))+
+        geom_boxplot(col='blue') + labs(x='Users attitude toward music', y = "Rating of a song by this artist") + scale_y_continuous(breaks= seq(0, 100, by=10))
+```
+
+# 3. Prepare the Data for Classification
+## 3.1 Convert objective to Binary
+```{r}
+# determine the cut_off for music recommendation
+cut_off <- 50
+
+# add a new binary column: 0 means not to recommend, 1 means recommend
+train_all$Recommend <- ifelse(train_all$Rating>=cut_off, 1 ,0)
+# Move the new objective column to front
+train_all <- train_all %>% select(User, Artist, Track, Rating, Recommend, everything())
+
+# Examine the distribution of the binary objective, 'Recommend'
+per_zero <- train_all %>% select(Recommend) %>% summarise(sum(Recommend==0)/nrow(train_all))
+per_one <- train_all %>% select(Recommend) %>% summarise(sum(Recommend==1)/nrow(train_all))
+print(paste("The percentage of Don't Recommend is", per_zero, ", and the percentage of Recommend is", per_one, ". The distribution is right skewed."))
+
+```
+
+## 3.2 Split the dataset to training and testing
+```{r}
+# Split dataset
+n <- nrow(train_all)
+indices <- sort(sample(1:n, round(0.8 * n)))
+train <- train_all[indices,]     # training part
+test <- train_all[-indices,]      # cv part
+
+
+train_form <- as.formula(paste('Recommend ~',
+                               paste(names(train)[6:ncol(train)], collapse=' + ')))
+
+```
+
+# 4. Fit with Different Classification Models
+## 4.1 Logistic Regression
+```{r}
+# Convert the objective into factor type
+train$Recommend <- as.factor(train$Recommend)
+
+# fit a logistic regression model
+model_glm <- glm(train_form, family=binomial(link='logit'), data=train)
+
+summary(model_glm)
+
+test$prob_glm <- predict(model_glm, test, type="response")
+
+# Density of probabilities
+ggplot(data.frame(test) , aes(prob_glm)) + 
+        geom_density(fill = 'lightblue' , alpha = 0.4) +
+        labs(x = 'Predicted Probabilities on test set')
+
+# Find optimum threshold
+k = 0
+accuracy = c()
+sensitivity = c()
+specificity = c()
+for(i in seq(from = 0.2 , to = 0.7 , by = 0.02)){
+        k = k + 1
+        preds_binomial_rf = ifelse(test$prob_glm > i , 1 , 0)
+        confmat = table(test$Recommend , preds_binomial_rf)
+        accuracy[k] = sum(diag(confmat)) / sum(confmat)
+        sensitivity[k] = confmat[2 , 2] / sum(confmat[2, ])
+        specificity[k] = confmat[1 , 1] / sum(confmat[1, ])
+}
+
+# Put the result all into a dataframe
+threshold = seq(from = 0.2 , to = 0.7 , by = 0.02)
+data = data.frame(threshold , accuracy , sensitivity , specificity)
+data
+
+# Gather accuracy , sensitivity and specificity in one column
+ggplot(gather(data , key = 'Metric' , value = 'Value' , 2:4) , 
+       aes(x = threshold , y = Value , color = Metric)) + 
+        geom_line(size = 1.5)
+
+
+# Get the confusion matrix at a cut-off of 0.5
+print("The confusion matrix at the default cut-off of 0.5:")
+preds_binomial_glm_cut = ifelse(test$prob_glm > 0.5 , 1 , 0)
+confmat = table(test$Recommend , preds_binomial_rf_cut)
+confmat
+# print out the evaluation data at the cut-off of 0.5
+data[11,]
+
+# update threshold
+# test$recommend_glm <- ifelse(test$prob_glm > 0.5 , 1 , 0)
+
+# Examine the distribution of the predicted objective variable, 'gbm_recommend'
+per_zero_glm <- test %>% select(recommend_glm) %>% summarise(sum(recommend_glm==0)/nrow(test))
+per_one_glm <- test %>% select(recommend_glm) %>% summarise(sum(recommend_glm==1)/nrow(test))
+print(paste("The percentage of Don't Recommend by the gbm model is", per_zero_glm, "comparing to the actual percentage of", per_zero, "; The percentage of Recommend by the gbm model is", per_one_glm, "comparing to the actual percentage of Recommend of", per_one))
+
+
+# report AUC
+auc_rf = roc(test$Recommend, test$prob_glm, plot = TRUE, col = "red")
+print(auc_rf)
+
+
+```
+
+## 4.2 Random Forest
+```{r}
+# Convert the objective into factor type
+train$Recommend <- as.factor(train$Recommend)
+# fit a random forest model
+model_rf <- randomForest(train_form, data = train, na.action=na.exclude,do.trace=50, ntree=450)
+
+summary(model_rf)
+
+predict_rf <- predict(model_rf, test, type='prob')
+test$prob_rf <- predict_rf[,"1"]
+
+#sum(test$prob_rf==test$Recommend)/nrow(test)
+# Density of probabilities
+ggplot(data=test , aes(prob_rf)) + 
+        geom_density(fill = 'lightblue' , alpha = 0.4) +
+        labs(x = 'Predicted Probabilities on test set')
+
+# Find optimum threshold
+k = 0
+accuracy = c()
+sensitivity = c()
+specificity = c()
+for(i in seq(from = 0.2 , to = 0.7 , by = 0.02)){
+        k = k + 1
+        preds_binomial_rf = ifelse(test$prob_rf > i , 1 , 0)
+        confmat = table(test$Recommend , preds_binomial_rf)
+        accuracy[k] = sum(diag(confmat)) / sum(confmat)
+        sensitivity[k] = confmat[2 , 2] / sum(confmat[2, ])
+        specificity[k] = confmat[1 , 1] / sum(confmat[1, ])
+}
+
+# Put the result all into a dataframe
+threshold = seq(from = 0.2 , to = 0.7 , by = 0.02)
+data = data.frame(threshold , accuracy , sensitivity , specificity)
+data
+
+# Gather accuracy , sensitivity and specificity in one column
+ggplot(gather(data , key = 'Metric' , value = 'Value' , 2:4) , 
+       aes(x = threshold , y = Value , color = Metric)) + 
+        geom_line(size = 1.5)
+
+# Get the confusion matrix at a cut-off of 0.5
+print("The confusion matrix at the default cut-off of 0.5:")
+preds_binomial_rf_cut = ifelse(test$prob_rf > 0.5 , 1 , 0)
+confmat = table(test$Recommend , preds_binomial_rf_cut)
+confmat
+# print out the evaluation data at the cut-off of 0.5
+data[11,]
+
+# update threshold
+# test$recommend_rf <- ifelse(test$prob_rf > 0.5 , 1 , 0)
+
+# Examine the distribution of the predicted objective variable, 'gbm_recommend'
+per_zero_rf <- test %>% select(recommend_rf) %>% summarise(sum(recommend_rf==0)/nrow(test))
+per_one_rf <- test %>% select(recommend_rf) %>% summarise(sum(recommend_rf==1)/nrow(test))
+print(paste("The percentage of Don't Recommend by the gbm model is", per_zero_rf, "comparing to the actual percentage of", per_zero, "; The percentage of Recommend by the gbm model is", per_one_rf, "comparing to the actual percentage of Recommend of", per_one))
+
+
+# report AUC
+auc_rf = roc(test$Recommend, predict_rf[,"1"], plot = TRUE, col = "red")
+print(auc_rf)
+```
+
+## Gradient Boosting Machine
+```{r}
+# fit a gradient boosting machine
+print('Training...')
+model_gbm <- gbm(train_form, n.trees=500, data=train_all,
+             distribution='bernoulli', interaction.depth=6,
+             train.fraction=.8, cv.folds=5)
+
+# reprot the result
+summary(model_gbm, las=2)
+
+# predict on cv set 
+test$prob_gbm <- predict(model_gbm, test, type='response')
+test$recommend_gbm <- round(test$prob_gbm)
+test <- test %>% select(User, Artist, Track, Rating, Recommend, prob_gbm, recommend_gbm, everything())
+
+
+# Density of probabilities
+ggplot(data.frame(test) , aes(prob_gbm)) + 
+        geom_density(fill = 'lightblue' , alpha = 0.4) +
+        labs(x = 'Predicted Probabilities on test set')
+
+# Find optimum threshold
+k = 0
+accuracy = c()
+sensitivity = c()
+specificity = c()
+for(i in seq(from = 0.2 , to = 0.7 , by = 0.02)){
+        k = k + 1
+        preds_binomial_gbm = ifelse(test$prob_gbm > i , 1 , 0)
+        confmat = table(test$Recommend , preds_binomial_gbm)
+        accuracy[k] = sum(diag(confmat)) / sum(confmat)
+        sensitivity[k] = confmat[2 , 2] / sum(confmat[2, ])
+        specificity[k] = confmat[1 , 1] / sum(confmat[1, ])
+}
+
+# Put the result all into a dataframe
+threshold = seq(from = 0.2 , to = 0.7 , by = 0.02)
+data = data.frame(threshold , accuracy , sensitivity , specificity)
+data
+
+# Gather accuracy , sensitivity and specificity in one column
+ggplot(gather(data , key = 'Metric' , value = 'Value' , 2:4) , 
+       aes(x = threshold , y = Value , color = Metric)) + 
+        geom_line(size = 1.5)
+
+# Get the confusion matrix at a cut-off of 0.5
+print("The confusion matrix at the default cut-off of 0.5:")
+preds_binomial_gbm_cut = ifelse(test$prob_gbm > 0.5 , 1 , 0)
+confmat = table(test$Recommend , preds_binomial_gbm_cut)
+confmat
+# print out the evaluation data at the cut-off of 0.5
+data[11,]
+
+# update threshold
+# test$recommend_gbm <- ifelse(test$prob_gbm > 0.5 , 1 , 0)
+
+# Examine the distribution of the predicted objective variable, 'gbm_recommend'
+per_zero_gbm <- test %>% select(recommend_gbm) %>% summarise(sum(recommend_gbm==0)/nrow(test))
+per_one_gbm <- test %>% select(recommend_gbm) %>% summarise(sum(recommend_gbm==1)/nrow(test))
+print(paste("The percentage of Don't Recommend by the gbm model is", per_zero_gbm, "comparing to the actual percentage of", per_zero, "; The percentage of Recommend by the gbm model is", per_one_gbm, "comparing to the actual percentage of Recommend of", per_one))
+
+# report AUC
+auc_gbm = roc(test$Recommend, test$prob_gbm, plot = TRUE, col = "red")
+print(auc_gbm)
+
+```
+
+### Coment on the evaluation method
+``` {r}
+print("Sensitivity: out of users who actually like the track, how many of them did we recommend? (predicted true); Specificity: out of users who actually don't like the track, how many of them did we NOT recommend? (predict false). Not recommending a prefer song to a user won't cause much loss, but recommending songs to users who don't like can impact negatively on retention. Therefore we want relatively high SPECIFICTY, and we have relatively high tolerance for low Sensitivity.")
+```
+
+## 5 Output result file for futher analysis
+```{r}
+model_results <- test %>% select(Rating, Recommend, prob_glm, prob_gbm, prob_rf)
+write.csv(model_results, "model_results.csv", row.names=FALSE)
+```
